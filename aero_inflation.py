@@ -55,6 +55,11 @@ BROKEN = float(os.getenv("INFLATION_BROKEN", "0.12"))  # back to old Aerodrome r
 SPIKE = float(os.getenv("SPIKE_THRESHOLD", "0.40"))
 
 # Chains that may hold xAERO. Each needs <CHAIN>_RPC_URL and XAERO_<CHAIN> in .env
+CAP_MULTIPLE = float(os.getenv("CAP_MULTIPLE", "1.2"))   # Aero's long-run rewards/revenue target
+STAKED_SHARE = float(os.getenv("STAKED_SHARE", "0.5"))   # ~half of supply is sAERO per Aero
+COINGECKO_ID = os.getenv("COINGECKO_ID", "aerodrome-finance")
+DEFILLAMA_SLUGS = [x.strip() for x in os.getenv("DEFILLAMA_SLUGS", "aero,aerodrome").split(",") if x.strip()]
+
 OTHER_CHAINS = ["ETHEREUM", "OPTIMISM", "ARBITRUM", "INK", "ROBINHOOD", "ARC"]
 
 
@@ -65,6 +70,8 @@ class Snapshot:
     xaero_supply: float
     foundation_balance: float | None
     excluded: float = 0.0  # cumulative one-off mints removed (e.g. VELO migration)
+    price: float | None = None      # AERO/USD
+    rev_30d: float | None = None    # holder revenue, last 30 days, USD
 
     @property
     def total(self) -> float:
@@ -135,11 +142,46 @@ def take_snapshot() -> Snapshot:
     foundation = os.getenv("AERO_FOUNDATION_ADDRESS")
     fbal = erc20_balance(base_rpc, aero, foundation) if foundation else None
 
-    return Snapshot(datetime.now(timezone.utc), base_supply, xaero_total, fbal)
+    return Snapshot(datetime.now(timezone.utc), base_supply, xaero_total, fbal,
+                    price=fetch_price(), rev_30d=fetch_holder_rev_30d())
+
+
+# ---------------------------------------------------------------- market data
+def fetch_price() -> float | None:
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": COINGECKO_ID, "vs_currencies": "usd"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        return float(r.json()[COINGECKO_ID]["usd"])
+    except Exception as e:
+        print(f"[price] unavailable: {e}")
+        return None
+
+
+def fetch_holder_rev_30d() -> float | None:
+    for slug in DEFILLAMA_SLUGS:
+        try:
+            r = requests.get(
+                f"https://api.llama.fi/summary/fees/{slug}",
+                params={"dataType": "dailyHoldersRevenue"},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                continue
+            v = r.json().get("total30d")
+            if v:
+                return float(v)
+        except Exception as e:
+            print(f"[defillama:{slug}] {e}")
+    print("[revenue] unavailable from DefiLlama")
+    return None
 
 
 # ---------------------------------------------------------------- history
-FIELDS = ["timestamp", "base_supply", "xaero_supply", "total_supply", "foundation_balance", "excluded"]
+FIELDS = ["timestamp", "base_supply", "xaero_supply", "total_supply", "foundation_balance", "excluded", "price", "rev_30d"]
 
 
 def load_history() -> list[Snapshot]:
@@ -156,13 +198,30 @@ def load_history() -> list[Snapshot]:
                     float(row["xaero_supply"]),
                     float(fb) if fb not in (None, "") else None,
                     float(row.get("excluded") or 0),
+                    float(row["price"]) if row.get("price") else None,
+                    float(row["rev_30d"]) if row.get("rev_30d") else None,
                 )
             )
     return out
 
 
+def _upgrade_header() -> None:
+    """Rewrite an older CSV with the current columns so new fields aren't lost."""
+    with HISTORY.open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        header = rows[0].keys() if rows else []
+    if rows and list(header) != FIELDS:
+        with HISTORY.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: (r.get(k) or "") for k in FIELDS})
+
+
 def append_history(s: Snapshot) -> None:
     HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    if HISTORY.exists():
+        _upgrade_header()
     new = not HISTORY.exists()
     with HISTORY.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -176,6 +235,8 @@ def append_history(s: Snapshot) -> None:
                 "total_supply": f"{s.total:.4f}",
                 "foundation_balance": "" if s.foundation_balance is None else f"{s.foundation_balance:.4f}",
                 "excluded": f"{s.excluded:.4f}",
+                "price": "" if s.price is None else f"{s.price:.6f}",
+                "rev_30d": "" if s.rev_30d is None else f"{s.rev_30d:.2f}",
             }
         )
 
@@ -273,11 +334,40 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
         "",
         f"Verdict: {verdict(headline)}",
     ]
+    lines += valuation_lines(cur, headline)
     if cur.foundation_balance is not None:
         share = cur.foundation_balance / cur.total if cur.total else 0
         lines.append(f"Foundation wallet: `{cur.foundation_balance:,.0f}` ({share * 100:.2f}% of supply)")
     lines += ["", "_Mint-on-claim: early weeks read low until LP claims catch up._"]
     return "\n".join(lines)
+
+
+def valuation_lines(cur: Snapshot, realized: float | None) -> list[str]:
+    if cur.price is None:
+        return ["", "_Price unavailable — valuation section skipped._"]
+    fdv = cur.adj_total * cur.price
+    out = ["", "*Valuation vs dilution*", f"  Price: `${cur.price:,.4f}`  FDV: `${fdv / 1e9:,.2f}B`"]
+    if not cur.rev_30d:
+        out.append("  _Holder revenue unavailable — check DEFILLAMA_SLUGS._")
+        return out
+    rev_yr = cur.rev_30d * 365 / 30
+    multiple = fdv / rev_yr
+    implied = CAP_MULTIPLE * rev_yr / fdv
+    staker = rev_yr / (STAKED_SHARE * fdv)
+    out += [
+        f"  Holder rev (30d, annualized): `${rev_yr / 1e6:,.0f}M`",
+        f"  FDV / revenue: `{multiple:,.1f}x`",
+        f"  Implied issuance at {CAP_MULTIPLE}x cap: `{pct(implied)}`",
+        f"  Staker gross yield (~{STAKED_SHARE:.0%} staked): `{pct(staker)}`",
+    ]
+    if realized is not None:
+        out.append(f"  Staker net of realized inflation: `{pct(staker - realized)}`")
+        gap = realized - implied
+        if gap > 0.03:
+            out.append("  ⚠️ Realized inflation well above implied — protocol overpaying")
+        elif implied >= BROKEN:
+            out.append("  ⚠️ Implied issuance high because price is low vs revenue (reflexive)")
+    return out
 
 
 # ---------------------------------------------------------------- telegram
@@ -328,7 +418,7 @@ def self_test() -> None:
     hist.append(Snapshot(t0, supply, 0, None))
     for i, r in enumerate(rates, 1):
         supply *= (1 + r) ** (7 / 365.25)
-        hist.append(Snapshot(t0 + timedelta(days=7 * i), supply * 0.97, supply * 0.03, 50_000_000))
+        hist.append(Snapshot(t0 + timedelta(days=7 * i), supply * 0.97, supply * 0.03, 50_000_000, price=0.84, rev_30d=14_900_000))
     cur = hist[-1]
     rep = build_report(hist[:-1], cur)
     print(rep)
@@ -337,7 +427,7 @@ def self_test() -> None:
 
     # VELO migration: +116M lands in one week on top of ~7% emissions
     print("\n--- migration week ---")
-    nxt = Snapshot(cur.ts + timedelta(days=7), cur.base_supply * 1.0013 + 116_000_000, cur.xaero_supply, 50_000_000)
+    nxt = Snapshot(cur.ts + timedelta(days=7), cur.base_supply * 1.0013 + 116_000_000, cur.xaero_supply, 50_000_000, price=0.84, rev_30d=14_900_000)
     ex = apply_spike_guard(hist, nxt)
     print(build_report(hist, nxt, ex))
     assert 110_000_000 < ex < 117_000_000, ex
