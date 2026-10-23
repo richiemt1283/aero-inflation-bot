@@ -162,6 +162,9 @@ def fetch_price() -> float | None:
 
 
 def fetch_holder_rev_30d() -> float | None:
+    """Spike-resistant 30d holder revenue: median daily x 30.
+    A single lump payment (e.g. Sep 9, 2026: $7.9M in one day) can double a plain 30d sum."""
+    global LAST_REV_INFO
     for slug in DEFILLAMA_SLUGS:
         try:
             r = requests.get(
@@ -171,13 +174,26 @@ def fetch_holder_rev_30d() -> float | None:
             )
             if r.status_code != 200:
                 continue
-            v = r.json().get("total30d")
-            if v:
-                return float(v)
+            body = r.json()
+            chart = body.get("totalDataChart") or []
+            days = [float(v) for _, v in chart[-30:] if v is not None]
+            if len(days) < 10:
+                v = body.get("total30d")
+                if v:
+                    return float(v)
+                continue
+            med = sorted(days)[len(days) // 2]
+            raw = sum(days)
+            spikes = [v for v in days if med > 0 and v > 5 * med]
+            LAST_REV_INFO = {"slug": slug, "raw30": raw, "median30": med * 30, "spikes": spikes}
+            return med * 30
         except Exception as e:
             print(f"[defillama:{slug}] {e}")
     print("[revenue] unavailable from DefiLlama")
     return None
+
+
+LAST_REV_INFO: dict = {}
 
 
 # ---------------------------------------------------------------- history
@@ -355,11 +371,14 @@ def valuation_lines(cur: Snapshot, realized: float | None) -> list[str]:
     implied = CAP_MULTIPLE * rev_yr / fdv
     staker = rev_yr / (STAKED_SHARE * fdv)
     out += [
-        f"  Holder rev (30d, annualized): `${rev_yr / 1e6:,.0f}M`",
+        f"  Holder rev (median-day run-rate): `${rev_yr / 1e6:,.0f}M/yr`",
         f"  FDV / revenue: `{multiple:,.1f}x`",
         f"  Implied issuance at {CAP_MULTIPLE}x cap: `{pct(implied)}`",
         f"  Staker gross yield (~{STAKED_SHARE:.0%} staked): `{pct(staker)}`",
     ]
+    info = LAST_REV_INFO
+    if info.get("spikes"):
+        out.append(f"  ⚠️ Lump payment in window: raw 30d `${info['raw30'] / 1e6:,.1f}M` vs run-rate `${info['median30'] / 1e6:,.1f}M`")
     if realized is not None:
         out.append(f"  Staker net of realized inflation: `{pct(staker - realized)}`")
         gap = realized - implied
