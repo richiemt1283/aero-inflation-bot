@@ -1,0 +1,41 @@
+name: AERO weekly inflation
+
+on:
+  schedule:
+    # Mondays 14:07 UTC (08:07 Mexico City)
+    - cron: "7 14 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Snapshot + report
+        env:
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          AERO_TOKEN_BASE: ${{ secrets.AERO_TOKEN_BASE }}
+          AERO_FOUNDATION_ADDRESS: ${{ secrets.AERO_FOUNDATION_ADDRESS }}
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          XAERO_ETHEREUM: ${{ secrets.XAERO_ETHEREUM }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          XAERO_OPTIMISM: ${{ secrets.XAERO_OPTIMISM }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          XAERO_ARBITRUM: ${{ secrets.XAERO_ARBITRUM }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python aero_inflation.py
+      - name: Commit history
+        run: |
+          git config user.name "aero-bot"
+          git config user.email "aero-bot@users.noreply.github.com"
+          git add data/supply_history.csv
+          git diff --cached --quiet || git commit -m "snapshot $(date -u +%F)"
+          git push
