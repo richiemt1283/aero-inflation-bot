@@ -39,3 +39,4 @@ jobs:
           git add data/supply_history.csv
           git diff --cached --quiet || git commit -m "snapshot $(date -u +%F)"
           git push
+
