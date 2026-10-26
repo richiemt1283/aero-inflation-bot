@@ -460,6 +460,8 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--min-days", type=float, default=0,
+                    help="skip quietly if the last snapshot is younger than this (scheduled runs)")
     a = ap.parse_args()
 
     if a.self_test:
@@ -468,6 +470,11 @@ def main() -> None:
         return check()
 
     history = load_history()
+    if a.min_days and history:
+        age = (datetime.now(timezone.utc) - history[-1].ts).total_seconds() / 86400
+        if age < a.min_days:
+            print(f"Last snapshot is {age:.1f} days old (< {a.min_days}); nothing to do.")
+            return
     cur = take_snapshot()
     new_ex = apply_spike_guard(history, cur)
     report = build_report(history, cur, new_ex)
