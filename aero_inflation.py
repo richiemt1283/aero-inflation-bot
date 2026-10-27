@@ -196,6 +196,195 @@ def fetch_holder_rev_30d() -> float | None:
 LAST_REV_INFO: dict = {}
 
 
+# ---------------------------------------------------------------- dune emissions
+DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "8980735")
+DUNE_DATE_COL = os.getenv("DUNE_DATE_COL", "")
+DUNE_USD_COL = os.getenv("DUNE_USD_COL", "")
+DUNE_AERO_COL = os.getenv("DUNE_AERO_COL", "")
+
+
+def _dune_get(path: str, key: str, **kw):
+    r = requests.request(kw.pop("method", "GET"), f"https://api.dune.com/api/v1/{path}",
+                         headers={"X-Dune-API-Key": key}, timeout=60, **kw)
+    r.raise_for_status()
+    return r.json()
+
+
+def _dune_rows(key: str, refresh: bool) -> tuple[list[dict], list[str]]:
+    import time
+    if refresh:
+        ex = _dune_get(f"query/{DUNE_QUERY_ID}/execute", key, method="POST")
+        eid = ex["execution_id"]
+        for _ in range(40):  # up to ~200s
+            st = _dune_get(f"execution/{eid}/status", key)
+            if st.get("state") == "QUERY_STATE_COMPLETED":
+                break
+            if st.get("state") in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"):
+                raise RuntimeError(f"Dune execution {st.get('state')}")
+            time.sleep(5)
+        body = _dune_get(f"execution/{eid}/results", key)
+    else:
+        body = _dune_get(f"query/{DUNE_QUERY_ID}/results", key, params={"limit": 5000})
+    res = body.get("result") or {}
+    return res.get("rows") or [], (res.get("metadata") or {}).get("column_names") or []
+
+
+def _pick(cols: list[str], override: str, must: tuple[str, ...], prefer: tuple[str, ...] = (), avoid: tuple[str, ...] = ()) -> str | None:
+    if override:
+        return override if override in cols else None
+    cands = [c for c in cols if all(m in c.lower() for m in must) and not any(x in c.lower() for x in avoid)]
+    for pref in prefer:
+        for c in cands:
+            if pref in c.lower():
+                return c
+    return cands[0] if cands else None
+
+
+def _to_date(v) -> datetime | None:
+    if v is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace(" UTC", "").replace("Z", "+00:00")[:25].replace(" ", "T"))
+    except ValueError:
+        return None
+
+
+EMISSIONS_CSV_URL = os.getenv("EMISSIONS_CSV_URL", "")
+
+
+def _csv_rows(url: str) -> tuple[list[dict], list[str]]:
+    import io
+    if not url.lower().startswith("http"):  # local file, e.g. data/emissions.csv
+        path = Path(url) if Path(url).is_absolute() else HERE / url
+        text = path.read_text(encoding="utf-8").lstrip("\ufeff")
+        if text.lstrip().startswith("{"):
+            data = json.loads(text)
+            if _find_launch(data):
+                return [{"__launch__": data}], ["__launch__"]
+        rd = csv.DictReader(io.StringIO(text))
+        rows = [{k: (v if v != "" else None) for k, v in row.items()} for row in rd]
+        return rows, rd.fieldnames or []
+    r = requests.get(url, timeout=60, headers={"User-Agent": "aero-inflation-bot"})
+    r.raise_for_status()
+    text = r.text.lstrip("\ufeff")
+    if text.lstrip().startswith(("{", "[")):  # JSON instead of CSV
+        data = r.json()
+        if isinstance(data, dict) and _find_launch(data):
+            return [{"__launch__": data}], ["__launch__"]
+        if isinstance(data, dict) and url.rstrip("/").endswith("aero-analytics"):
+            return _csv_rows(url.rstrip("/")[: -len("aero-analytics")] + "aero-launch")
+        rows = data if isinstance(data, list) else (data.get("rows") or data.get("data") or [])
+        return rows, list(rows[0].keys()) if rows else []
+    rd = csv.DictReader(io.StringIO(text))
+    rows = [{k: (v if v != "" else None) for k, v in row.items()} for row in rd]
+    return rows, rd.fieldnames or []
+
+
+def _find_launch(node, depth: int = 0):
+    """Find the block with days + values.emissions anywhere in the JSON."""
+    if depth > 6:
+        return None
+    if isinstance(node, dict):
+        v = node.get("values")
+        if "days" in node and isinstance(v, dict) and isinstance(v.get("emissions"), list):
+            return node
+        for k in ("launch",) + tuple(node.keys()):
+            if k in node:
+                hit = _find_launch(node[k], depth + 1)
+                if hit:
+                    return hit
+    return None
+
+
+def _parse_launch_json(data: dict) -> dict | None:
+    """Dromos Kitchen JSON: a block with days + values.{emissions,voting_rewards,...}."""
+    L = _find_launch(data)
+    if not L:
+        return None
+    days = [datetime.fromisoformat(d).date() for d in L["days"]]
+    vals = L["values"]
+    today = datetime.now(timezone.utc).date()
+    idx = [i for i, d in enumerate(days) if d < today][-7:] or list(range(len(days)))[-7:]
+    avg = lambda k: (sum(vals[k][i] for i in idx) / len(idx)) if vals.get(k) else None
+    last = idx[-1]
+    chains = {c: v["emissions"][last] for c, v in (L.get("byChain") or {}).items() if v.get("emissions")}
+    fees_by_chain = {c: sum(v["fees"][i] for i in idx) for c, v in (L.get("byChain") or {}).items() if v.get("fees")}
+    return {
+        "source": "dromos launch json", "latest": days[last], "n_days": len(idx),
+        "usd_per_day": avg("emissions"), "aero_per_day": None,
+        "rewards_per_day": avg("voting_rewards"), "fees_per_day": avg("fees"),
+        "chains": chains, "fees_by_chain": fees_by_chain,
+    }
+
+
+def fetch_dune_emissions(refresh: bool = False) -> dict | None:
+    """Daily AERO emissions: from EMISSIONS_CSV_URL (free, e.g. the Dromos dashboard's
+    CSV link) or the Dune API if DUNE_API_KEY is set.
+    Returns trailing-7-full-day totals (USD and/or AERO), latest day, columns."""
+    key = os.getenv("DUNE_API_KEY")
+    if not (EMISSIONS_CSV_URL or key):
+        return None
+    try:
+        rows, cols = _csv_rows(EMISSIONS_CSV_URL) if EMISSIONS_CSV_URL else _dune_rows(key, refresh)
+        if cols == ["__launch__"]:
+            return _parse_launch_json(rows[0]["__launch__"]) or {"error": "unrecognized JSON"}
+        if not rows:
+            return {"error": "no rows", "cols": cols}
+        cols = cols or list(rows[0].keys())
+        dcol = (_pick(cols, DUNE_DATE_COL, ("day",)) or _pick(cols, "", ("date",))
+                or _pick(cols, "", ("time",)) or _pick(cols, "", ("epoch",)))
+        bad = ("fee", "revenue", "tvl", "volume", "legacy", "velo", "allocation")
+        ucol = (_pick(cols, DUNE_USD_COL, ("usd",), prefer=("aero", "emission"), avoid=bad)
+                or (None if DUNE_USD_COL else _pick(cols, "", ("aero",), avoid=bad + ("price",))))
+        acol = _pick(cols, DUNE_AERO_COL, ("aero",), prefer=("emission", "amount", "token"), avoid=bad + ("usd", "price", "$"))
+        if not acol:
+            acol = _pick(cols, "", ("emission",), avoid=bad + ("usd", "price"))
+        if ucol and acol == ucol:
+            acol = None
+        if not dcol or not (ucol or acol):
+            return {"error": "could not identify columns", "cols": cols}
+        by_day: dict = {}
+        for r in rows:
+            if str(r.get("partial_day", "")).lower() == "true":
+                continue
+            d = _to_date(r.get(dcol))
+            if d is None:
+                continue
+            k = d.date()
+            agg = by_day.setdefault(k, [0.0, 0.0])
+            if ucol and r.get(ucol) not in (None, ""):
+                agg[0] += float(str(r[ucol]).replace(",", ""))
+            if acol and r.get(acol) not in (None, ""):
+                agg[1] += float(str(r[acol]).replace(",", ""))
+        days = sorted(d for d in by_day if by_day[d][0] > 0 or by_day[d][1] > 0)
+        if not days:
+            return {"error": "no dated rows", "cols": cols}
+        today = datetime.now(timezone.utc).date()
+        full = [d for d in days if d < today][-7:]  # skip today's partial day
+        if not full:
+            full = days[-7:]
+        n = len(full)
+        chain_cols = [c for c in cols if c.lower().startswith("aero_") and c != ucol and c != acol]
+        chains = {}
+        if chain_cols:
+            last = full[-1]
+            for r in rows:
+                d = _to_date(r.get(dcol))
+                if d and d.date() == last and str(r.get("partial_day", "")).lower() != "true":
+                    for c in chain_cols:
+                        if r.get(c) not in (None, ""):
+                            chains[c[5:]] = chains.get(c[5:], 0.0) + float(r[c])
+        return {
+            "chains": chains,
+            "cols": cols, "date_col": dcol, "usd_col": ucol, "aero_col": acol,
+            "latest": days[-1], "n_days": n,
+            "usd_per_day": sum(by_day[d][0] for d in full) / n if ucol else None,
+            "aero_per_day": sum(by_day[d][1] for d in full) / n if acol else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---------------------------------------------------------------- history
 FIELDS = ["timestamp", "base_supply", "xaero_supply", "total_supply", "foundation_balance", "excluded", "price", "rev_30d"]
 
@@ -313,7 +502,7 @@ def pct(x: float | None) -> str:
     return "n/a" if x is None else f"{x * 100:.2f}%"
 
 
-def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0.0) -> str:
+def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0.0, em: dict | None = None) -> str:
     prev = history[-1] if history else None
     wk = nearest_before(history, cur, 7)
     m4 = nearest_before(history, cur, 28)
@@ -358,6 +547,7 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
          "capturing emissions; inflation unknown" if frozen else f"Verdict: {verdict(headline)}"),
     ]
     lines += valuation_lines(cur, headline)
+    lines += emissions_lines(em, cur)
     if cur.foundation_balance is not None:
         share = cur.foundation_balance / cur.total if cur.total else 0
         lines.append(f"Foundation wallet: `{cur.foundation_balance:,.0f}` ({share * 100:.2f}% of supply)")
@@ -393,6 +583,48 @@ def valuation_lines(cur: Snapshot, realized: float | None) -> list[str]:
             out.append("  ⚠️ Realized inflation well above implied — protocol overpaying")
         elif implied >= BROKEN:
             out.append("  ⚠️ Implied issuance high because price is low vs revenue (reflexive)")
+    return out
+
+
+def emissions_lines(em: dict | None, cur: Snapshot) -> list[str]:
+    if em is None:
+        return []
+    if em.get("error"):
+        return ["", f"_Dune emissions unavailable: {em['error']}_"]
+    out = ["", "*Emissions (Aero v3, daily data)*",
+           f"  Data through: `{em['latest']}`  ({em['n_days']}-day avg)"]
+    infl = None
+    if em.get("aero_per_day"):
+        out.append(f"  AERO emitted/day: `{em['aero_per_day']:,.0f}`")
+        infl = em["aero_per_day"] * 365 / cur.adj_total
+    usd = em.get("usd_per_day")
+    if usd is None and em.get("aero_per_day") and cur.price:
+        usd = em["aero_per_day"] * cur.price
+    if usd:
+        out.append(f"  USD emitted/day: `${usd:,.0f}`")
+        if infl is None and cur.price:
+            infl = usd * 365 / (cur.adj_total * cur.price)
+    if infl is not None:
+        out.append(f"  Emissions-based inflation: `{pct(infl)}`  {verdict(infl)[:1]}")
+    rew = em.get("rewards_per_day") or (cur.rev_30d / 30 if cur.rev_30d else None)
+    if em.get("rewards_per_day"):
+        out.append(f"  Staker rewards/day (Aero v3): `${em['rewards_per_day']:,.0f}`")
+    if usd and rew:
+        ratio = rew / usd
+        tag = "🔴 stakers losing" if ratio < 0.5 else "🟡 stakers positive" if ratio < 0.83 else "🟢 caps binding" if ratio < 1 else "🟢 revenue covers dilution"
+        out.append(f"  Rewards / emissions: `{ratio:.2f}x`  {tag}")
+        if infl is not None:
+            out.append(f"  Staker net (gross − emissions infl.): `{pct((rew * 365) / (STAKED_SHARE * cur.adj_total * cur.price) - infl)}`")
+    ch = em.get("chains") or {}
+    tot = sum(ch.values())
+    if tot > 0:
+        base = ch.get("base", 0) / tot
+        others = sorted(((k, v / tot) for k, v in ch.items() if k != "base"), key=lambda x: -x[1])
+        out.append(f"  Emissions on Base: `{base:.0%}`  other chains: `{1 - base:.0%}`")
+        out.append("  " + ", ".join(f"{k} {v:.1%}" for k, v in others[:4]))
+    stale = (datetime.now(timezone.utc).date() - em["latest"]).days
+    if stale > 3:
+        out.append(f"  ⚠️ Dune data is {stale} days old")
     return out
 
 
@@ -467,6 +699,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--check-dune", action="store_true", help="show Dune columns and parsed emissions")
     ap.add_argument("--min-days", type=float, default=0,
                     help="skip quietly if the last snapshot is younger than this (scheduled runs)")
     a = ap.parse_args()
@@ -475,6 +708,13 @@ def main() -> None:
         return self_test()
     if a.check:
         return check()
+    if a.check_dune:
+        em = fetch_dune_emissions(refresh=False)
+        print(json.dumps(em, default=str, indent=2))
+        if em and not em.get("error") and not EMISSIONS_CSV_URL and (datetime.now(timezone.utc).date() - em["latest"]).days > 2:
+            print("Cached results stale; executing query (uses Dune credits)...")
+            print(json.dumps(fetch_dune_emissions(refresh=True), default=str, indent=2))
+        return
 
     history = load_history()
     if a.min_days and history:
@@ -484,7 +724,10 @@ def main() -> None:
             return
     cur = take_snapshot()
     new_ex = apply_spike_guard(history, cur)
-    report = build_report(history, cur, new_ex)
+    em = fetch_dune_emissions(refresh=False)
+    if em and not em.get("error") and not EMISSIONS_CSV_URL and (datetime.now(timezone.utc).date() - em["latest"]).days > 2:
+        em = fetch_dune_emissions(refresh=True) or em
+    report = build_report(history, cur, new_ex, em)
     print(report)
     if a.dry_run:
         return
