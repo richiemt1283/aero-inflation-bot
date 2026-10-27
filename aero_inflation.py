@@ -326,6 +326,12 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
 
     headline = r_4w if r_4w is not None else r_wk if r_wk is not None else r_all
 
+    # A real emitting token never sits perfectly flat for days. If it does, this
+    # contract isn't where emissions land, so don't report a fake 0%.
+    frozen = bool(first) and cur.total == first.total and (cur.ts - first.ts).total_seconds() > 2 * 86400
+    if frozen:
+        headline = None
+
     lines = [
         "✈️ *AERO weekly inflation*",
         f"`{cur.ts:%Y-%m-%d %H:%M} UTC`",
@@ -348,7 +354,8 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
         f"  4-week: `{pct(r_4w)}`",
         f"  Since first snapshot: `{pct(r_all)}`",
         "",
-        f"Verdict: {verdict(headline)}",
+        ("Verdict: ⚠️ supply frozen since first snapshot — this contract is NOT "
+         "capturing emissions; inflation unknown" if frozen else f"Verdict: {verdict(headline)}"),
     ]
     lines += valuation_lines(cur, headline)
     if cur.foundation_balance is not None:
