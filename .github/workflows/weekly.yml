@@ -30,7 +30,8 @@ jobs:
           XAERO_OPTIMISM: ${{ secrets.XAERO_OPTIMISM }}
           ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
           XAERO_ARBITRUM: ${{ secrets.XAERO_ARBITRUM }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          EMISSIONS_CSV_URL: ${{ secrets.EMISSIONS_CSV_URL }}          
+TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python aero_inflation.py ${{ github.event_name == 'schedule' && '--min-days 6' || '' }}
       - name: Commit history
