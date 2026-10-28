@@ -517,9 +517,11 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
 
     # A real emitting token never sits perfectly flat for days. If it does, this
     # contract isn't where emissions land, so don't report a fake 0%.
-    frozen = bool(first) and cur.total == first.total and (cur.ts - first.ts).total_seconds() > 2 * 86400
+    # CSV stores 4 decimals, RPC returns 18 -> compare with a tolerance, not ==
+    frozen = bool(first) and abs(cur.total - first.total) < 1.0 and (cur.ts - first.ts).total_seconds() > 2 * 86400
     if frozen:
         headline = None
+    em_infl = emissions_inflation(em, cur)
 
     lines = [
         "✈️ *AERO weekly inflation*",
@@ -543,10 +545,14 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
         f"  4-week: `{pct(r_4w)}`",
         f"  Since first snapshot: `{pct(r_all)}`",
         "",
-        ("Verdict: ⚠️ supply frozen since first snapshot — this contract is NOT "
-         "capturing emissions; inflation unknown" if frozen else f"Verdict: {verdict(headline)}"),
+        (f"Verdict (emissions-based {pct(em_infl)}): {verdict(em_infl)}" if em_infl is not None
+         else "Verdict: ⚠️ supply frozen since first snapshot — this contract is NOT "
+              "capturing emissions; inflation unknown" if frozen else f"Verdict: {verdict(headline)}"),
     ]
-    lines += valuation_lines(cur, headline)
+    if frozen:
+        lines.append("_On-chain supply is frozen (new rewards not minted on this contract); "
+                     "use the Emissions section below._")
+    lines += valuation_lines(cur, None if frozen else headline)
     lines += emissions_lines(em, cur)
     if cur.foundation_balance is not None:
         share = cur.foundation_balance / cur.total if cur.total else 0
@@ -584,6 +590,16 @@ def valuation_lines(cur: Snapshot, realized: float | None) -> list[str]:
         elif implied >= BROKEN:
             out.append("  ⚠️ Implied issuance high because price is low vs revenue (reflexive)")
     return out
+
+
+def emissions_inflation(em: dict | None, cur: Snapshot) -> float | None:
+    if not em or em.get("error"):
+        return None
+    if em.get("aero_per_day"):
+        return em["aero_per_day"] * 365 / cur.adj_total
+    if em.get("usd_per_day") and cur.price:
+        return em["usd_per_day"] * 365 / (cur.adj_total * cur.price)
+    return None
 
 
 def emissions_lines(em: dict | None, cur: Snapshot) -> list[str]:
