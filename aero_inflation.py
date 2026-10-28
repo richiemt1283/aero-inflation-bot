@@ -60,7 +60,17 @@ STAKED_SHARE = float(os.getenv("STAKED_SHARE", "0.5"))   # ~half of supply is sA
 COINGECKO_ID = os.getenv("COINGECKO_ID", "aerodrome-finance")
 DEFILLAMA_SLUGS = [x.strip() for x in os.getenv("DEFILLAMA_SLUGS", "aero,aerodrome").split(",") if x.strip()]
 
-OTHER_CHAINS = ["ETHEREUM", "OPTIMISM", "ARBITRUM", "INK", "ROBINHOOD", "ARC"]
+# Off by default: the new AERO launched with its full supply pre-minted (~2.12B), so migration
+# moves existing tokens instead of minting new ones. Supply growth = emissions only.
+MIGRATION_MODE = os.getenv("MIGRATION_MODE", "0") == "1" and bool(
+    os.getenv("LEGACY_AERO_TOKEN") and os.getenv("AERO_MIGRATION_ADDRESS"))
+# Aerodrome final supply 2.0026B = 94.5% of merged token -> ~2.119B total at launch
+ECON_BASE = float(os.getenv("ECON_BASE", "2119000000"))
+VELO_TOKEN_OP = os.getenv("VELO_TOKEN_OP", "0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db")
+VELO_MIGRATION_OP = os.getenv("VELO_MIGRATION_OP", "0x6daE95FE833f190640dB1176F8C8a2e50C6a66c0")
+VELO_RATIO = float(os.getenv("VELO_RATIO", "0.044"))
+
+OTHER_CHAINS = ["BASE", "ETHEREUM", "OPTIMISM", "ARBITRUM", "INK", "ROBINHOOD", "ARC"]  # xAERO receipt tokens
 
 
 @dataclass
@@ -72,6 +82,7 @@ class Snapshot:
     excluded: float = 0.0  # cumulative one-off mints removed (e.g. VELO migration)
     price: float | None = None      # AERO/USD
     rev_30d: float | None = None    # holder revenue, last 30 days, USD
+    migrated: float = 0.0           # legacy AERO held by the migration contract (minted 1:1 as new AERO)
 
     @property
     def total(self) -> float:
@@ -79,8 +90,14 @@ class Snapshot:
 
     @property
     def adj_total(self) -> float:
-        """Supply minus one-off mints: what inflation is measured on."""
-        return self.total - self.excluded
+        """Supply minus one-off mints and migrated tokens (= new AERO actually emitted, in migration mode)."""
+        return self.total - self.excluded - self.migrated
+
+    @property
+    def econ(self) -> float:
+        """Economic supply: what holders are diluted against.
+        In migration mode = full post-merger supply (legacy AERO + VELO share) + emissions minted since."""
+        return (ECON_BASE + self.adj_total) if MIGRATION_MODE else self.adj_total
 
 
 # ---------------------------------------------------------------- RPC helpers
@@ -134,16 +151,42 @@ def take_snapshot() -> Snapshot:
 
     xaero_total = 0.0
     for chain in OTHER_CHAINS:
-        rpc = os.getenv(f"{chain}_RPC_URL")
+        rpc = os.getenv(f"{chain}_RPC_URL") or (base_rpc if chain == "BASE" else None)
         token = os.getenv(f"XAERO_{chain}")
         if rpc and token:
-            xaero_total += erc20_total_supply(rpc, token)
+            try:
+                v = erc20_total_supply(rpc, token)
+                XAERO_BY_CHAIN[chain.lower()] = v
+                xaero_total += v
+            except Exception as e:
+                print(f"[xAERO {chain}] {e}")
+
+    migrated = 0.0
+    legacy, mig = os.getenv("LEGACY_AERO_TOKEN"), os.getenv("AERO_MIGRATION_ADDRESS")
+    if MIGRATION_MODE and legacy and mig:
+        try:
+            migrated = erc20_balance(base_rpc, legacy, mig)
+        except Exception as e:
+            print(f"[migration] {e}")
+        op_rpc = os.getenv("OPTIMISM_RPC_URL")
+        if op_rpc and VELO_TOKEN_OP and VELO_MIGRATION_OP:
+            try:
+                velo = erc20_balance(op_rpc, VELO_TOKEN_OP, VELO_MIGRATION_OP)
+                MIGRATION_INFO["velo_migrated"] = velo
+                migrated += velo * VELO_RATIO
+            except Exception as e:
+                print(f"[velo migration] {e}")
+        MIGRATION_INFO["legacy_total"] = migrated
 
     foundation = os.getenv("AERO_FOUNDATION_ADDRESS")
     fbal = erc20_balance(base_rpc, aero, foundation) if foundation else None
 
     return Snapshot(datetime.now(timezone.utc), base_supply, xaero_total, fbal,
-                    price=fetch_price(), rev_30d=fetch_holder_rev_30d())
+                    price=fetch_price(), rev_30d=fetch_holder_rev_30d(), migrated=migrated)
+
+
+XAERO_BY_CHAIN: dict = {}
+MIGRATION_INFO: dict = {}
 
 
 # ---------------------------------------------------------------- market data
@@ -386,7 +429,7 @@ def fetch_dune_emissions(refresh: bool = False) -> dict | None:
 
 
 # ---------------------------------------------------------------- history
-FIELDS = ["timestamp", "base_supply", "xaero_supply", "total_supply", "foundation_balance", "excluded", "price", "rev_30d"]
+FIELDS = ["timestamp", "base_supply", "xaero_supply", "total_supply", "foundation_balance", "excluded", "price", "rev_30d", "migrated"]
 
 
 def load_history() -> list[Snapshot]:
@@ -405,6 +448,7 @@ def load_history() -> list[Snapshot]:
                     float(row.get("excluded") or 0),
                     float(row["price"]) if row.get("price") else None,
                     float(row["rev_30d"]) if row.get("rev_30d") else None,
+                    float(row.get("migrated") or 0),
                 )
             )
     return out
@@ -442,6 +486,7 @@ def append_history(s: Snapshot) -> None:
                 "excluded": f"{s.excluded:.4f}",
                 "price": "" if s.price is None else f"{s.price:.6f}",
                 "rev_30d": "" if s.rev_30d is None else f"{s.rev_30d:.2f}",
+                "migrated": f"{s.migrated:.4f}",
             }
         )
 
@@ -449,9 +494,9 @@ def append_history(s: Snapshot) -> None:
 # ---------------------------------------------------------------- math
 def annualized(prev: Snapshot, cur: Snapshot) -> float | None:
     days = (cur.ts - prev.ts).total_seconds() / 86400
-    if days < 0.5 or prev.adj_total <= 0:
+    if days < 0.5 or prev.econ <= 0:
         return None
-    return (cur.adj_total / prev.adj_total) ** (365.25 / days) - 1
+    return (cur.econ / prev.econ) ** (365.25 / days) - 1
 
 
 def apply_spike_guard(history: list[Snapshot], cur: Snapshot) -> float:
@@ -471,7 +516,7 @@ def apply_spike_guard(history: list[Snapshot], cur: Snapshot) -> float:
     base_rate = annualized(m4, prev) if m4 else None
     if base_rate is None or base_rate < 0 or base_rate >= SPIKE:
         base_rate = WATCH
-    expected = prev.adj_total * ((1 + base_rate) ** (days / 365.25) - 1)
+    expected = prev.econ * ((1 + base_rate) ** (days / 365.25) - 1)
     excess = max(0.0, (cur.total - prev.total) - expected)
     cur.excluded += excess
     return excess
@@ -518,7 +563,7 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
     # A real emitting token never sits perfectly flat for days. If it does, this
     # contract isn't where emissions land, so don't report a fake 0%.
     # CSV stores 4 decimals, RPC returns 18 -> compare with a tolerance, not ==
-    frozen = bool(first) and abs(cur.total - first.total) < 1.0 and (cur.ts - first.ts).total_seconds() > 2 * 86400
+    frozen = bool(first) and abs(cur.adj_total - first.adj_total) < 1.0 and (cur.ts - first.ts).total_seconds() > 2 * 86400
     if frozen:
         headline = None
     em_infl = emissions_inflation(em, cur)
@@ -529,10 +574,16 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
         "",
         f"Total supply: `{cur.total:,.0f}`",
         f"  Base AERO: `{cur.base_supply:,.0f}`",
-        f"  xAERO (other chains): `{cur.xaero_supply:,.0f}`",
+        f"  xAERO (receipt tokens): `{cur.xaero_supply:,.0f}`"
+        + (f" ({', '.join(f'{k} {v:,.0f}' for k, v in XAERO_BY_CHAIN.items() if v >= 1)})" if XAERO_BY_CHAIN else ""),
     ]
+    if MIGRATION_MODE:
+        lines.append(f"  Migrated in (AERO + VELO×{VELO_RATIO}): `{cur.migrated:,.0f}` "
+                     f"({cur.migrated / ECON_BASE:.0%} of ~{ECON_BASE / 1e9:.2f}B)")
+        lines.append(f"  New AERO emitted since launch: `{cur.adj_total:,.0f}`")
+        lines.append(f"  Economic supply: `{cur.econ:,.0f}`")
     if prev:
-        lines.append(f"Minted since last: `{cur.total - prev.total:+,.0f}`")
+        lines.append(f"Minted since last (ex-migration): `{cur.adj_total - prev.adj_total:+,.0f}`")
     if new_excluded > 0:
         lines.append(f"⚠️ One-off mint suspected (VELO migration?): `{new_excluded:,.0f}` excluded from inflation")
     if cur.excluded > 0:
@@ -555,7 +606,7 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
     lines += valuation_lines(cur, None if frozen else headline)
     lines += emissions_lines(em, cur)
     if cur.foundation_balance is not None:
-        share = cur.foundation_balance / cur.total if cur.total else 0
+        share = cur.foundation_balance / cur.econ if cur.econ else 0
         lines.append(f"Foundation wallet: `{cur.foundation_balance:,.0f}` ({share * 100:.2f}% of supply)")
     lines += ["", "_Mint-on-claim: early weeks read low until LP claims catch up._"]
     return "\n".join(lines)
@@ -564,7 +615,7 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
 def valuation_lines(cur: Snapshot, realized: float | None) -> list[str]:
     if cur.price is None:
         return ["", "_Price unavailable — valuation section skipped._"]
-    fdv = cur.adj_total * cur.price
+    fdv = cur.econ * cur.price
     out = ["", "*Valuation vs dilution*", f"  Price: `${cur.price:,.4f}`  FDV: `${fdv / 1e9:,.2f}B`"]
     if not cur.rev_30d:
         out.append("  _Holder revenue unavailable — check DEFILLAMA_SLUGS._")
@@ -596,9 +647,9 @@ def emissions_inflation(em: dict | None, cur: Snapshot) -> float | None:
     if not em or em.get("error"):
         return None
     if em.get("aero_per_day"):
-        return em["aero_per_day"] * 365 / cur.adj_total
+        return em["aero_per_day"] * 365 / cur.econ
     if em.get("usd_per_day") and cur.price:
-        return em["usd_per_day"] * 365 / (cur.adj_total * cur.price)
+        return em["usd_per_day"] * 365 / (cur.econ * cur.price)
     return None
 
 
@@ -612,14 +663,14 @@ def emissions_lines(em: dict | None, cur: Snapshot) -> list[str]:
     infl = None
     if em.get("aero_per_day"):
         out.append(f"  AERO emitted/day: `{em['aero_per_day']:,.0f}`")
-        infl = em["aero_per_day"] * 365 / cur.adj_total
+        infl = em["aero_per_day"] * 365 / cur.econ
     usd = em.get("usd_per_day")
     if usd is None and em.get("aero_per_day") and cur.price:
         usd = em["aero_per_day"] * cur.price
     if usd:
         out.append(f"  USD emitted/day: `${usd:,.0f}`")
         if infl is None and cur.price:
-            infl = usd * 365 / (cur.adj_total * cur.price)
+            infl = usd * 365 / (cur.econ * cur.price)
     if infl is not None:
         out.append(f"  Emissions-based inflation: `{pct(infl)}`  {verdict(infl)[:1]}")
     rew = em.get("rewards_per_day") or (cur.rev_30d / 30 if cur.rev_30d else None)
@@ -630,7 +681,7 @@ def emissions_lines(em: dict | None, cur: Snapshot) -> list[str]:
         tag = "🔴 stakers losing" if ratio < 0.5 else "🟡 stakers positive" if ratio < 0.83 else "🟢 caps binding" if ratio < 1 else "🟢 revenue covers dilution"
         out.append(f"  Rewards / emissions: `{ratio:.2f}x`  {tag}")
         if infl is not None:
-            out.append(f"  Staker net (gross − emissions infl.): `{pct((rew * 365) / (STAKED_SHARE * cur.adj_total * cur.price) - infl)}`")
+            out.append(f"  Staker net (gross − emissions infl.): `{pct((rew * 365) / (STAKED_SHARE * cur.econ * cur.price) - infl)}`")
     ch = em.get("chains") or {}
     tot = sum(ch.values())
     if tot > 0:

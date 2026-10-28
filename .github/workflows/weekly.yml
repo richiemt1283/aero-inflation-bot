@@ -22,15 +22,19 @@ jobs:
       - name: Snapshot + report
         env:
           BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
-          AERO_TOKEN_BASE: ${{ secrets.AERO_TOKEN_BASE }}
+          AERO_TOKEN_BASE: ${{ secrets.AERO_TOKEN_BASE || '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee' }}
           AERO_FOUNDATION_ADDRESS: ${{ secrets.AERO_FOUNDATION_ADDRESS }}
-          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
-          XAERO_ETHEREUM: ${{ secrets.XAERO_ETHEREUM }}
-          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
-          XAERO_OPTIMISM: ${{ secrets.XAERO_OPTIMISM }}
-          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
-          XAERO_ARBITRUM: ${{ secrets.XAERO_ARBITRUM }}
-          EMISSIONS_CSV_URL: ${{ secrets.EMISSIONS_CSV_URL }}          
+          XAERO_BASE: "0x6CdDa0E730744DC6fF67654B35350Adad05EceE7"
+          INK_RPC_URL: "https://rpc-gel.inkonchain.com"
+          XAERO_INK: "0x9e148C5716b5aAdCFD3B71cEAE9EE7a9e22C29E2"
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL || 'https://ethereum-rpc.publicnode.com' }}
+          XAERO_ETHEREUM: ${{ secrets.XAERO_ETHEREUM || '0x9e148C5716b5aAdCFD3B71cEAE9EE7a9e22C29E2' }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL || 'https://mainnet.optimism.io' }}
+          XAERO_OPTIMISM: ${{ secrets.XAERO_OPTIMISM || '0xbdEaeA5205d16f34Cb40038052d91235D87B4C54' }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL || 'https://arb1.arbitrum.io/rpc' }}
+          XAERO_ARBITRUM: ${{ secrets.XAERO_ARBITRUM || '0x436a085B2751cB87db270FFa66f8d698F87bEC82' }}
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+          EMISSIONS_CSV_URL: ${{ secrets.EMISSIONS_CSV_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python aero_inflation.py ${{ github.event_name == 'schedule' && '--min-days 6' || '' }}
