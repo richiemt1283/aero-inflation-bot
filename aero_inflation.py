@@ -20,7 +20,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -769,6 +769,8 @@ def main() -> None:
     ap.add_argument("--check-dune", action="store_true", help="show Dune columns and parsed emissions")
     ap.add_argument("--min-days", type=float, default=0,
                     help="skip quietly if the last snapshot is younger than this (scheduled runs)")
+    ap.add_argument("--weekly", action="store_true",
+                    help="scheduled mode: report on Mondays (Mexico City), or catch up if 7.5+ days since last")
     a = ap.parse_args()
 
     if a.self_test:
@@ -784,6 +786,13 @@ def main() -> None:
         return
 
     history = load_history()
+    if a.weekly and history:
+        now = datetime.now(timezone.utc)
+        age = (now - history[-1].ts).total_seconds() / 86400
+        is_monday_mx = (now - timedelta(hours=6)).weekday() == 0
+        if not ((is_monday_mx and age >= 1) or age >= 7.5):
+            print(f"Not Monday (or already ran today); last snapshot {age:.1f} days old. Nothing to do.")
+            return
     if a.min_days and history:
         age = (datetime.now(timezone.utc) - history[-1].ts).total_seconds() / 86400
         if age < a.min_days:

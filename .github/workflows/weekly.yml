@@ -2,8 +2,8 @@ name: AERO weekly inflation
 
 on:
   schedule:
-    # Checks daily at 14:07 UTC (08:07 Mexico City); the script only reports
-    # when the last snapshot is 6+ days old, so a skipped Monday self-heals Tuesday.
+    # Checks daily at 14:07 UTC (08:07 Mexico City). Reports every Monday; if GitHub
+    # skips Monday, the next day catches up (7.5+ days since last report).
     - cron: "7 14 * * *"
   workflow_dispatch: {}
 
@@ -37,7 +37,7 @@ jobs:
           EMISSIONS_CSV_URL: ${{ secrets.EMISSIONS_CSV_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python aero_inflation.py ${{ github.event_name == 'schedule' && '--min-days 6' || '' }}
+        run: python aero_inflation.py ${{ github.event_name == 'schedule' && '--weekly' || '' }}
       - name: Commit history
         run: |
           git config user.name "aero-bot"
