@@ -58,6 +58,7 @@ SPIKE = float(os.getenv("SPIKE_THRESHOLD", "0.40"))
 CAP_MULTIPLE = float(os.getenv("CAP_MULTIPLE", "1.2"))   # Aero's long-run rewards/revenue target
 STAKED_SHARE = float(os.getenv("STAKED_SHARE", "0.5"))   # ~half of supply is sAERO per Aero
 COINGECKO_ID = os.getenv("COINGECKO_ID", "aerodrome-finance")
+FOCUS_CHAINS = [x.strip().lower() for x in os.getenv("FOCUS_CHAINS", "base,ethereum,robinhood").split(",") if x.strip()]
 DEFILLAMA_SLUGS = [x.strip() for x in os.getenv("DEFILLAMA_SLUGS", "aero,aerodrome").split(",") if x.strip()]
 
 # Off by default: the new AERO launched with its full supply pre-minted (~2.12B), so migration
@@ -351,12 +352,20 @@ def _parse_launch_json(data: dict) -> dict | None:
     avg = lambda k: (sum(vals[k][i] for i in idx) / len(idx)) if vals.get(k) else None
     last = idx[-1]
     chains = {c: v["emissions"][last] for c, v in (L.get("byChain") or {}).items() if v.get("emissions")}
+    per_chain = {}
+    for c, v in (L.get("byChain") or {}).items():
+        def cav(k, v=v):
+            arr = v.get(k) or []
+            xs = [arr[i] for i in idx if i < len(arr) and arr[i] is not None]
+            return sum(xs) / len(xs) if xs else None
+        per_chain[c] = {"emissions": cav("emissions"), "rewards": cav("voting_rewards"),
+                        "fees": cav("fees"), "volume": cav("volume")}
     fees_by_chain = {c: sum(v["fees"][i] for i in idx) for c, v in (L.get("byChain") or {}).items() if v.get("fees")}
     return {
         "source": "dromos launch json", "latest": days[last], "n_days": len(idx),
         "usd_per_day": avg("emissions"), "aero_per_day": None,
         "rewards_per_day": avg("voting_rewards"), "fees_per_day": avg("fees"),
-        "chains": chains, "fees_by_chain": fees_by_chain,
+        "chains": chains, "fees_by_chain": fees_by_chain, "per_chain": per_chain,
     }
 
 
@@ -633,7 +642,7 @@ def valuation_lines(cur: Snapshot, realized: float | None) -> list[str]:
     info = LAST_REV_INFO
     if info.get("spikes"):
         out.append(f"  ⚠️ Lump payment in window: raw 30d `${info['raw30'] / 1e6:,.1f}M` vs run-rate `${info['median30'] / 1e6:,.1f}M`")
-    if realized is not None:
+    if realized is not None and not (EMISSIONS_CSV_URL or os.getenv("DUNE_API_KEY")):
         out.append(f"  Staker net of realized inflation: `{pct(staker - realized)}`")
         gap = realized - implied
         if gap > 0.03:
@@ -689,9 +698,24 @@ def emissions_lines(em: dict | None, cur: Snapshot) -> list[str]:
         others = sorted(((k, v / tot) for k, v in ch.items() if k != "base"), key=lambda x: -x[1])
         out.append(f"  Emissions on Base: `{base:.0%}`  other chains: `{1 - base:.0%}`")
         out.append("  " + ", ".join(f"{k} {v:.1%}" for k, v in others[:4]))
+    pc = em.get("per_chain") or {}
+    tot_em = sum((d.get("emissions") or 0) for d in pc.values())
+    focus = [c for c in FOCUS_CHAINS if c in pc]
+    if focus:
+        out.append("")
+        out.append("*Per chain (avg/day)*")
+        for c in focus:
+            d = pc[c]
+            e, r = d.get("emissions") or 0, d.get("rewards") or 0
+            ratio = r / e if e else None
+            tag = "" if ratio is None else ("🔴" if ratio < 0.5 else "🟡" if ratio < 0.83 else "🟢")
+            share = f"{e / tot_em:.0%}" if tot_em else "n/a"
+            vol = d.get("volume")
+            out.append(f"  {c.capitalize()}: emit `${e:,.0f}` ({share}) · stakers `${r:,.0f}` · "
+                       f"ratio `{ratio:.2f}x` {tag}" + (f" · vol `${vol / 1e6:,.0f}M`" if vol else ""))
     stale = (datetime.now(timezone.utc).date() - em["latest"]).days
     if stale > 3:
-        out.append(f"  ⚠️ Dune data is {stale} days old")
+        out.append(f"  ⚠️ Emissions data is {stale} days old")
     return out
 
 

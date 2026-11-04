@@ -35,6 +35,7 @@ jobs:
           XAERO_ARBITRUM: ${{ secrets.XAERO_ARBITRUM || '0x436a085B2751cB87db270FFa66f8d698F87bEC82' }}
           DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
           EMISSIONS_CSV_URL: ${{ secrets.EMISSIONS_CSV_URL }}
+          FOCUS_CHAINS: "base,ethereum,robinhood,arbitrum"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python aero_inflation.py ${{ github.event_name == 'schedule' && '--weekly' || '' }}
