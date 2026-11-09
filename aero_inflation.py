@@ -308,9 +308,15 @@ def _csv_rows(url: str) -> tuple[list[dict], list[str]]:
         rd = csv.DictReader(io.StringIO(text))
         rows = [{k: (v if v != "" else None) for k, v in row.items()} for row in rd]
         return rows, rd.fieldnames or []
-    r = requests.get(url, timeout=60, headers={"User-Agent": "aero-inflation-bot"})
+    r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0 (aero-inflation-bot)",
+                                               "Cache-Control": "no-cache"})
     r.raise_for_status()
     text = r.text.lstrip("\ufeff")
+    if text.lstrip().startswith("<"):  # dashboard HTML: data is embedded in the Next.js RSC payload
+        data = _extract_rsc_launch(text)
+        if data is None:
+            raise RuntimeError("no aeroLaunch data found in dashboard page")
+        return [{"__launch__": data}], ["__launch__"]
     if text.lstrip().startswith(("{", "[")):  # JSON instead of CSV
         data = r.json()
         if isinstance(data, dict) and _find_launch(data):
@@ -322,6 +328,34 @@ def _csv_rows(url: str) -> tuple[list[dict], list[str]]:
     rd = csv.DictReader(io.StringIO(text))
     rows = [{k: (v if v != "" else None) for k, v in row.items()} for row in rd]
     return rows, rd.fieldnames or []
+
+
+def _extract_rsc_launch(html: str) -> dict | None:
+    """Pull the {"days":..., "values":..., "byChain":...} block out of a Next.js page."""
+    import re
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)', html)
+    raw = "".join(json.loads(c) for c in chunks) if chunks else html
+    for key in ('"aeroLaunch"', '"launch"'):
+        pos = 0
+        while (at := raw.find(key, pos)) != -1:
+            pos = at + 1
+            start = raw.find("{", at)
+            depth = 0
+            for k in range(start, len(raw)):
+                ch = raw[k]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(raw[start:k + 1])
+                        except ValueError:
+                            break
+                        if _find_launch(obj):
+                            return obj
+                        break
+    return None
 
 
 def _find_launch(node, depth: int = 0):
@@ -576,6 +610,10 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
     if frozen:
         headline = None
     em_infl = emissions_inflation(em, cur)
+    em_stale = bool(em and not em.get("error") and em.get("latest")
+                    and (datetime.now(timezone.utc).date() - em["latest"]).days > 3)
+    if em_stale and not frozen and (r_4w is not None or r_wk is not None):
+        em_infl = None  # stale feed: fall back to fresh on-chain inflation
 
     lines = [
         "✈️ *AERO weekly inflation*",
@@ -606,6 +644,8 @@ def build_report(history: list[Snapshot], cur: Snapshot, new_excluded: float = 0
         f"  Since first snapshot: `{pct(r_all)}`",
         "",
         (f"Verdict (emissions-based {pct(em_infl)}): {verdict(em_infl)}" if em_infl is not None
+         else f"Verdict (on-chain {'4-week' if r_4w is not None else '1-week'} {pct(headline)}): {verdict(headline)}"
+         + (" — emissions feed stale, using on-chain" if em_stale else "") if (em_stale and headline is not None)
          else "Verdict: ⚠️ supply frozen since first snapshot — this contract is NOT "
               "capturing emissions; inflation unknown" if frozen else f"Verdict: {verdict(headline)}"),
     ]
